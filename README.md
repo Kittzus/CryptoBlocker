@@ -7,6 +7,8 @@ The script will install File Server Resource Manager (FSRM), and set up the rele
 
 <b>Script Deployment Steps</b>
 
+<i><b>NOTE:</b> Before running, please add any known good file extensions used in your environment to SkipList.txt, one per line.  This will ensure that if a filescreen is added to the list in the future that blocks that specific file extension, your environment won't be affected as they will be automatically removed.  If SkipList.txt does not exist, it will be created automatically.</i>
+
 1. Checks for network shares
 2. Installs FSRM
 3. Create batch/PowerShell scripts used by FSRM
@@ -16,13 +18,7 @@ The script will install File Server Resource Manager (FSRM), and set up the rele
 
 <b> How it Works</b>
 
-If the user writes a malicious file (as contained in the file group) to a network share, FSRM will run the deployed script which will add a Deny permission for that user against every share.
-
-This has been tested fairly thoroughly, and I find that at most ransomware ends up encrypting one directory before the user is blocked.
-
-The script has now been modified to pull the list of extensions from a JSON API.  Credit to https://fsrm.experiant.ca/ for this list.
-Make sure you review the list (https://fsrm.experiant.ca/api/v1/get) before deploying, in case any false positives are listed (e.g. I have seen CAD software legitimately use *.encrypted before).
-When this list is updated, review it and simply run the script again to redeploy.
+If the user attempts to write a malicious file (as described in the filescreen) to a protected network share, FSRM will prevent the file from being written and send an email to the configured administrators notifying them of the user and file location where the attempted file write occured.
 
 <b>NOTE: This will NOT stop variants which use randomised file extensions, don't drop README files, etc</b>
 

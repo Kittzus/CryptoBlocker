@@ -1,99 +1,128 @@
-﻿# DeployCryptoBlocker.ps1
-#
-# This script performs the following actions:
-# 1) Checks for network shares
-# 2) Install File Server Resource Manager (FSRM) if missing
-# 3) Creates Batch and PowerShell scripts used by FSRM
-# 4) Creates a File Group within FSRM containing malicious extensions to screen on
-# 5) Creates a File Screen Template utilising this File Group, with an Event notification and Command notification
-#    to run the scripts created in Step 3)
-# 6) Creates File Screens utilising this template for each drive containing network shares
+# DeployCryptoBlocker.ps1
+# Version: 1.1
+#####
+
+################################ USER CONFIGURATION ################################
+
+# Names to use in FSRM
+$fileGroupName = "CryptoBlockerGroup"
+$fileTemplateName = "CryptoBlockerTemplate"
+# set screening type to
+# Active screening: Do not allow users to save unathorized files
+$fileTemplateType = "Active"
+# Passive screening: Allow users to save unathorized files (use for monitoring)
+#$fileTemplateType = "Passiv"
+
+# Write the email options to the temporary file - comment out the entire block if no email notification should be set
+$EmailNotification = $env:TEMP + "\tmpEmail001.tmp"
+"Notification=m" >> $EmailNotification
+"To=[Admin Email]" >> $EmailNotification
+## en
+"Subject=Unauthorized file from the [Violated File Group] file group detected" >> $EmailNotification
+"Message=User [Source Io Owner] attempted to save [Source File Path] to [File Screen Path] on the [Server] server. This file is in the [Violated File Group] file group, which is not permitted on the server."  >> $EmailNotification
+## de
+#"Subject=Nicht autorisierte Datei erkannt, die mit Dateigruppe [Violated File Group] übereinstimmt" >> $EmailNotification
+#"Message=Das System hat erkannt, dass Benutzer [Source Io Owner] versucht hat, die Datei [Source File Path] unter [File Screen Path] auf Server [Server] zu speichern. Diese Datei weist Übereinstimmungen mit der Dateigruppe [Violated File Group] auf, die auf dem System nicht zulässig ist."  >> $EmailNotification
+
+# Write the event log options to the temporary file - comment out the entire block if no event notification should be set
+$EventNotification = $env:TEMP + "\tmpEvent001.tmp"
+"Notification=e" >> $EventNotification
+"EventType=Warning" >> $EventNotification
+## en
+"Message=User [Source Io Owner] attempted to save [Source File Path] to [File Screen Path] on the [Server] server. This file is in the [Violated File Group] file group, which is not permitted on the server." >> $EventNotification
+## de
+#"Message=Das System hat erkannt, dass Benutzer [Source Io Owner] versucht hat, die Datei [Source File Path] unter [File Screen Path] auf Server [Server] zu speichern. Diese Datei weist Übereinstimmungen mit der Dateigruppe [Violated File Group] auf, die auf dem System nicht zulässig ist." >> $EventNotification
+
+################################ USER CONFIGURATION ################################
 
 ################################ Functions ################################
 
-Function PurgeNonAdminDirectoryPermissions([string] $directory)
+Function ConvertFrom-Json20
 {
-    $acl = Get-Acl $directory
-
-    if ($acl.AreAccessRulesProtected)
-    {
-        $acl.Access | % { $acl.PurgeAccessRules($_.IdentityReference) }
-    }
-    else
-    {
-        $acl.SetAccessRuleProtection($true, $true)
-    }
-
-    $ar = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM","FullControl","Allow")
-    $acl.AddAccessRule($ar)
-    $ar = $ar = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators","FullControl","Allow")
-    $acl.AddAccessRule($ar)
-    Set-Acl -AclObject $acl -Path $directory
-}
-
-function ConvertFrom-Json20([Object] $obj)
-{
+    # Deserializes JSON input into PowerShell object output
+    Param (
+        [Object] $obj
+    )
     Add-Type -AssemblyName System.Web.Extensions
     $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
     return ,$serializer.DeserializeObject($obj)
 }
 
-Function New-CBArraySplit {
-
+Function New-CBArraySplit
+{
+    <# 
+        Takes an array of file extensions and checks if they would make a string >4Kb, 
+        if so, turns it into several arrays
+    #>
     param(
-        $extArr,
-        $depth = 1
+        $Extensions
     )
 
-    $extArr = $extArr | Sort-Object -Unique
+    $Extensions = $Extensions | Sort-Object -Unique
 
-    # Concatenate the input array
-    $conStr = $extArr -join ','
-    $outArr = @()
+    $workingArray = @()
+    $WorkingArrayIndex = 1
+    $LengthOfStringsInWorkingArray = 0
 
-    # If the input string breaks the 4Kb limit
-    If ($conStr.Length -gt 4096) {
-        # Pull the first 4096 characters and split on comma
-        $conArr = $conStr.SubString(0,4096).Split(',')
-        # Find index of the last guaranteed complete item of the split array in the input array
-        $endIndex = [array]::IndexOf($extArr,$conArr[-2])
-        # Build shorter array up to that indexNumber and add to output array
-        $shortArr = $extArr[0..$endIndex]
-        $outArr += [psobject] @{
-            index = $depth
-            array = $shortArr
+    # TODO - is the FSRM limit for bytes or characters?
+    #        maybe [System.Text.Encoding]::UTF8.GetBytes($_).Count instead?
+    #        -> in case extensions have Unicode characters in them
+    #        and the character Length is <4Kb but the byte count is >4Kb
+
+    # Take the items from the input array and build up a 
+    # temporary workingarray, tracking the length of the items in it and future commas
+    $Extensions | ForEach-Object {
+
+        if (($LengthOfStringsInWorkingArray + 1 + $_.Length) -gt 4000) 
+        {   
+            # Adding this item to the working array (with +1 for a comma)
+            # pushes the contents past the 4Kb limit
+            # so output the workingArray
+            [PSCustomObject]@{
+                index = $WorkingArrayIndex
+                FileGroupName = "$Script:FileGroupName$WorkingArrayIndex"
+                array = $workingArray
+            }
+            
+            # and reset the workingArray and counters
+            $workingArray = @($_) # new workingArray with current Extension in it
+            $LengthOfStringsInWorkingArray = $_.Length
+            $WorkingArrayIndex++
+
         }
-
-        # Then call this function again to split further
-        $newArr = $extArr[($endindex + 1)..($extArr.Count -1)]
-        $outArr += New-CBArraySplit $newArr -depth ($depth + 1)
-        
-        return $outArr
+        else #adding this item to the workingArray is fine
+        {
+            $workingArray += $_
+            $LengthOfStringsInWorkingArray += (1 + $_.Length)  #1 for imaginary joining comma
+        }
     }
-    # If the concat string is less than 4096 characters already, just return the input array
-    Else {
-        return [psobject] @{
-            index = $depth
-            array = $extArr
-        }  
+
+    # The last / only workingArray won't have anything to push it past 4Kb
+    # and trigger outputting it, so output that one as well
+    [PSCustomObject]@{
+        index = ($WorkingArrayIndex)
+        FileGroupName = "$Script:FileGroupName$WorkingArrayIndex"
+        array = $workingArray
     }
 }
 
 ################################ Functions ################################
 
-# Add to all drives
-$drivesContainingShares = Get-WmiObject Win32_Share | Select Name,Path,Type | Where-Object { $_.Type -eq 0 } | Select -ExpandProperty Path | % { "$((Get-Item -ErrorAction SilentlyContinue $_).Root)" } | Select -Unique
-if ($drivesContainingShares -eq $null -or $drivesContainingShares.Length -eq 0)
+################################ Program code ################################
+
+# Identify Windows Server version, PowerShell version and install FSRM role
+$majorVer = [System.Environment]::OSVersion.Version.Major
+$minorVer = [System.Environment]::OSVersion.Version.Minor
+$powershellVer = $PSVersionTable.PSVersion.Major
+
+if ($powershellVer -le 2)
 {
-    Write-Host "No drives containing shares were found. Exiting.."
+    Write-Host "`n####"
+    Write-Host "ERROR: PowerShell v3 or higher required."
     exit
 }
 
-Write-Host "The following shares needing to be protected: $($drivesContainingShares -Join ",")"
-
-$majorVer = [System.Environment]::OSVersion.Version.Major
-$minorVer = [System.Environment]::OSVersion.Version.Minor
-
+Write-Host "`n####"
 Write-Host "Checking File Server Resource Manager.."
 
 Import-Module ServerManager
@@ -102,183 +131,163 @@ if ($majorVer -ge 6)
 {
     $checkFSRM = Get-WindowsFeature -Name FS-Resource-Manager
 
-    if ($minorVer -ge 2 -and $checkFSRM.Installed -ne "True")
+    if (($minorVer -ge 2 -or $majorVer -eq 10) -and $checkFSRM.Installed -ne "True")
     {
-        # Server 2012
-        Write-Host "FSRM not found.. Installing (2012).."
-        Install-WindowsFeature -Name FS-Resource-Manager -IncludeManagementTools
+        # Server 2012 / 2016
+        Write-Host "`n####"
+        Write-Host "FSRM not found.. Installing (2012 / 2016).."
+
+        $install = Install-WindowsFeature -Name FS-Resource-Manager -IncludeManagementTools
+	if ($? -ne $True)
+	{
+		Write-Host "Install of FSRM failed."
+		exit
+	}
     }
     elseif ($minorVer -ge 1 -and $checkFSRM.Installed -ne "True")
     {
         # Server 2008 R2
-        Write-Host "FSRM not found.. Installing (2008 R2).."
-        Add-WindowsFeature FS-FileServer, FS-Resource-Manager
+        Write-Host "`n####"
+		Write-Host "FSRM not found.. Installing (2008 R2).."
+        $install = Add-WindowsFeature FS-FileServer, FS-Resource-Manager
+	if ($? -ne $True)
+	{
+		Write-Host "Install of FSRM failed."
+		exit
+	}
+	
     }
     elseif ($checkFSRM.Installed -ne "True")
     {
         # Server 2008
-        Write-Host "FSRM not found.. Installing (2008).."
-        &servermanagercmd -Install FS-FileServer FS-Resource-Manager
+        Write-Host "`n####"
+		Write-Host "FSRM not found.. Installing (2008).."
+        $install = &servermanagercmd -Install FS-FileServer FS-Resource-Manager
+	if ($? -ne $True)
+	{
+		Write-Host "Install of FSRM failed."
+		exit
+	}
     }
 }
 else
 {
     # Assume Server 2003
-    Write-Host "Other version of Windows detected! Quitting.."
+    Write-Host "`n####"
+	Write-Host "Unsupported version of Windows detected! Quitting.."
     return
 }
 
-$fileGroupName = "CryptoBlockerGroup"
-$fileTemplateName = "CryptoBlockerTemplate"
-$fileScreenName = "CryptoBlockerScreen"
+## Enumerate shares
+f (Test-Path .\ProtectList.txt)
+{
+    $drivesContainingShares = Get-Content .\ProtectList.txt | ForEach-Object { $_.Trim() }
+}
+Else {
+    $drivesContainingShares =   @(Get-WmiObject Win32_Share | 
+                    Select Name,Path,Type | 
+                    Where-Object { $_.Type -match '0|2147483648' } | 
+                    Select -ExpandProperty Path | 
+                    Select -Unique)
+}
 
-$webClient = New-Object System.Net.WebClient
-$jsonStr = $webClient.DownloadString("https://fsrm.experiant.ca/api/v1/get")
-$monitoredExtensions = @(ConvertFrom-Json20($jsonStr) | % { $_.filters })
+
+if ($drivesContainingShares.Count -eq 0)
+{
+    Write-Host "`n####"
+    Write-Host "No drives containing shares were found. Exiting.."
+    exit
+}
+
+Write-Host "`n####"
+Write-Host "The following shares needing to be protected: $($drivesContainingShares -Join ",")"
+
+# Download list of CryptoLocker file extensions
+Write-Host "`n####"
+Write-Host "Dowloading CryptoLocker file extensions list from fsrm.experiant.ca api.."
+
+$jsonStr = Invoke-WebRequest -Uri https://fsrm.experiant.ca/api/v1/get
+$monitoredExtensions = @(ConvertFrom-Json20 $jsonStr | ForEach-Object { $_.filters })
+
+# Process SkipList.txt
+Write-Host "`n####"
+Write-Host "Processing SkipList.."
+If (Test-Path .\SkipList.txt)
+{
+    $Exclusions = Get-Content .\SkipList.txt | ForEach-Object { $_.Trim() }
+    $monitoredExtensions = $monitoredExtensions | Where-Object { $Exclusions -notcontains $_ }
+
+}
+Else 
+{
+    $emptyFile = @'
+#
+# Add one filescreen per line that you want to ignore
+#
+# For example, if *.doc files are being blocked by the list but you want 
+# to allow them, simply add a new line in this file that exactly matches 
+# the filescreen:
+#
+# *.doc
+#
+# The script will check this file every time it runs and remove these 
+# entries before applying the list to your FSRM implementation.
+#
+'@
+    Set-Content -Path .\SkipList.txt -Value $emptyFile
+}
 
 # Split the $monitoredExtensions array into fileGroups of less than 4kb to allow processing by filescrn.exe
-$fileGroups = New-CBArraySplit $monitoredExtensions
-ForEach ($group in $fileGroups) {
-    $group | Add-Member -MemberType NoteProperty -Name fileGroupName -Value "$FileGroupName$($group.index)"
-}
-
-$scriptFilename = "C:\FSRMScripts\KillUserSession.ps1"
-$batchFilename = "C:\FSRMScripts\KillUserSession.bat"
-$eventConfFilename = "$env:Temp\cryptoblocker-eventnotify.txt"
-$cmdConfFilename = "$env:Temp\cryptoblocker-cmdnotify.txt"
-
-$scriptConf = @'
-param([string] $DomainUser)
-
-Function DenySharePermission ([string] $ShareName, [string] $DomainUser)
-{
-    $domainUserSplit = $DomainUser.Split("\")
-
-    $trusteeClass = [wmiclass] "ROOT\CIMV2:Win32_Trustee"
-    $trustee = $trusteeClass.CreateInstance()
-    $trustee.Domain = $domainUserSplit[0]
-    $trustee.Name = $domainUserSplit[1]
-
-    $aceClass = [wmiclass] "ROOT\CIMV2:Win32_ACE"
-    $ace = $aceClass.CreateInstance()
-    $ace.AccessMask = 2032127
-    $ace.AceType = 1
-    $ace.Trustee = $trustee
-
-    $shss = Get-WmiObject -Class Win32_LogicalShareSecuritySetting -Filter "Name='$ShareName'"
-    $sd = Invoke-WmiMethod -InputObject $shss -Name GetSecurityDescriptor | Select -ExpandProperty Descriptor
-
-    $sclass = [wmiclass] "ROOT\CIMV2:Win32_SecurityDescriptor"
-    $newsd = $sclass.CreateInstance()
-    $newsd.ControlFlags = $sd.ControlFlags
-
-    foreach ($oace in $sd.DACL)
-    {
-        $newsd.DACL +=  [System.Management.ManagementBaseObject] $oace
-    }
-
-    $newsd.DACL += [System.Management.ManagementBaseObject] $ace
-
-    $share = Get-WmiObject -Class Win32_LogicalShareSecuritySetting -Filter "Name='$ShareName'"
-    $setResult = $share.SetSecurityDescriptor($newsd)
-
-    return $setResult.ReturnValue
-}
-
-
-# Let's try altering share permissions..
-$Username = $DomainUser.Split("\")[1]
-
-$affectedShares = Get-WmiObject -Class Win32_Share |
-                    Select Name, Path, Type |
-                    Where { $_.Type -eq 0 }
-
-$affectedShares | % {
-    Write-Host "Denying [$DomainUser] access to share [$($_.Name)].."
-    DenySharePermission -ShareName $_.Name -DomainUser $DomainUser
-}
-
-Write-Host $affectedShares
-'@
-
-$batchConf = @"
-@echo off
-powershell.exe -ExecutionPolicy Bypass -File "$scriptFilename" -DomainUser %1
-"@
-
-$scriptDirectory = Split-Path -Parent $scriptFilename
-$batchDirectory = Split-Path -Parent $batchFilename
-
-if (-not (Test-Path $scriptDirectory))
-{
-    Write-Host "Script directory [$scriptDirectory] not found. Creating.."
-    New-Item -Path $scriptDirectory -ItemType Directory
-}
-
-if (-not (Test-Path $batchDirectory))
-{
-    Write-Host "Batch directory [$batchDirectory] not found. Creating.."
-    New-Item -Path $batchDirectory -ItemType Directory
-}
-
-# FSRM stipulates that the command directories/files can only be accessible by SYSTEM or Administrators
-# As a result, we lock down permissions for SYSTEM and local admin only
-Write-Host "Purging Non-Admin NTFS permissions on script directory [$scriptDirectory].."
-PurgeNonAdminDirectoryPermissions($scriptDirectory)
-Write-Host "Purging Non-Admin NTFS permissions on batch directory [$batchDirectory].."
-PurgeNonAdminDirectoryPermissions($batchDirectory)
-
-Write-Host "Writing defensive PowerShell script to location [$scriptFilename].."
-$scriptConf | Out-File -Encoding ASCII $scriptFilename
-Write-Host "Writing batch script launcher to location [$batchFilename].."
-$batchConf | Out-File -Encoding ASCII $batchFilename
-
-$eventConf = @"
-Notification=E
-RunLimitInterval=0
-EventType=Warning
-Message=User [Source Io Owner] attempted to save [Source File Path] to [File Screen Path] on the [Server] server. This file is in the [Violated File Group] file group, which is not permitted on the server.  An attempt has been made at blocking this user.
-"@
-
-$cmdConf = @"
-Notification=C
-RunLimitInterval=0
-Command=$batchFilename
-Arguments=[Source Io Owner]
-MonitorCommand=Enable
-Account=LocalSystem
-"@
-
-Write-Host "Writing temporary FSRM Event Viewer configuration to location [$eventConfFilename].."
-$eventConf | Out-File $eventConfFilename
-Write-Host "Writing temporary FSRM Command configuration to location [$cmdConfFilename].."
-$cmdConf | Out-File $cmdConfFilename
+$fileGroups = @(New-CBArraySplit $monitoredExtensions)
 
 # Perform these steps for each of the 4KB limit split fileGroups
+Write-Host "`n####"
+Write-Host "Adding/replacing File Groups.."
 ForEach ($group in $fileGroups) {
-    Write-Host "Adding/replacing File Group [$($group.fileGroupName)] with monitored file [$($group.array -Join ",")].."
-    &filescrn.exe filegroup Delete "/Filegroup:$($group.fileGroupName)" /Quiet
+    #Write-Host "Adding/replacing File Group [$($group.fileGroupName)] with monitored file [$($group.array -Join ",")].."
+    Write-Host "`nFile Group [$($group.fileGroupName)] with monitored files from [$($group.array[0])] to [$($group.array[$group.array.GetUpperBound(0)])].."
+	&filescrn.exe filegroup Delete "/Filegroup:$($group.fileGroupName)" /Quiet
     &filescrn.exe Filegroup Add "/Filegroup:$($group.fileGroupName)" "/Members:$($group.array -Join '|')"
 }
 
-Write-Host "Adding/replacing File Screen Template [$fileTemplateName] with Event Notification [$eventConfFilename] and Command Notification [$cmdConfFilename].."
+# Create File Screen Template with Notification
+Write-Host "`n####"
+Write-Host "Adding/replacing [$fileTemplateType] File Screen Template [$fileTemplateName] with eMail Notification [$EmailNotification] and Event Notification [$EventNotification].."
 &filescrn.exe Template Delete /Template:$fileTemplateName /Quiet
-# Build the argument list with all required fileGroups
-$screenArgs = 'Template','Add',"/Template:$fileTemplateName"
+# Build the argument list with all required fileGroups and notifications
+$screenArgs = 'Template', 'Add', "/Template:$fileTemplateName", "/Type:$fileTemplateType"
 ForEach ($group in $fileGroups) {
     $screenArgs += "/Add-Filegroup:$($group.fileGroupName)"
 }
-$screenArgs += "/Add-Notification:E,$eventConfFilename","/Add-Notification:C,$cmdConfFilename",'/Type:Passive'
+If ($EmailNotification -ne "") {
+    $screenArgs += "/Add-Notification:m,$EmailNotification"
+}
+If ($EventNotification -ne "") {
+    $screenArgs += "/Add-Notification:e,$EventNotification"
+}
 &filescrn.exe $screenArgs
 
+# Create File Screens for every drive containing shares
+Write-Host "`n####"
 Write-Host "Adding/replacing File Screens.."
-$drivesContainingShares | % {
-    Write-Host "`tAdding/replacing File Screen for [$_] with Source Template [$fileTemplateName].."
+$drivesContainingShares | ForEach-Object {
+    Write-Host "File Screen for [$_] with Source Template [$fileTemplateName].."
     &filescrn.exe Screen Delete "/Path:$_" /Quiet
     &filescrn.exe Screen Add "/Path:$_" "/SourceTemplate:$fileTemplateName"
 }
 
-Write-Host "Removing temporary FSRM Event Viewer configuration file [$eventConfFilename].."
-Write-Host "Removing temporary FSRM Event Viewer configuration file [$cmdConfFilename].."
-Remove-Item $eventConfFilename
-Remove-Item $cmdConfFilename
+# Cleanup temporary files if they were created
+Write-Host "`n####"
+Write-Host "Cleaning up temporary stuff.."
+If ($EmailNotification -ne "") {
+	Remove-Item $EmailNotification -Force
+}
+If ($EventNotification -ne "") {
+	Remove-Item $EventNotification -Force
+}
+
+Write-Host "`n####"
+Write-Host "Done."
+Write-Host "####"
+
+################################ Program code ################################
